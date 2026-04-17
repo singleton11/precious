@@ -1,0 +1,13 @@
+[project]
+name = "precious"
+version = "0.1.0"
+description = "Agent management server and web client"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+precious-server = "server.app:main"
+
+[tool.uv]
+package = true
