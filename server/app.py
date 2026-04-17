@@ -28,6 +28,9 @@ DEFAULT_AGENTS = [
     {"id": "acp-reviewer", "name": "ACP Reviewer"},
 ]
 
+VALID_THINKING_EFFORTS = {"low", "medium", "high"}
+VALID_MODES = {"plan", "build", "chat"}
+
 
 def now_iso() -> str:
     return datetime.now(tz=UTC).isoformat()
@@ -43,10 +46,15 @@ def make_handler(state: AppState, server_password: str):
             self.end_headers()
             self.wfile.write(body)
 
-        def _read_json(self) -> dict[str, Any]:
+        def _read_json(self) -> dict[str, Any] | None:
             content_length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(content_length)
-            return json.loads(raw.decode("utf-8")) if raw else {}
+            if not raw:
+                return {}
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return None
 
         def _require_password(self) -> bool:
             if not self.path.startswith("/api/"):
@@ -87,23 +95,28 @@ def make_handler(state: AppState, server_password: str):
             if self._serve_client(path):
                 return
 
+            if path == "/health":
+                self._send_json({"status": "ok"})
+                return
+
             if not self._require_password():
                 return
 
-            if path == "/health":
-                self._send_json({"status": "ok"})
-            elif path == "/api/repositories":
+            if path == "/api/repositories":
                 with state.lock:
-                    self._send_json(state.repositories)
+                    payload = list(state.repositories)
+                self._send_json(payload)
             elif path == "/api/agents":
                 self._send_json(DEFAULT_AGENTS)
             elif path == "/api/sessions":
                 with state.lock:
-                    self._send_json(state.sessions)
+                    payload = list(state.sessions)
+                self._send_json(payload)
             elif path.startswith("/api/sessions/") and path.endswith("/tool-calls"):
                 session_id = path.split("/")[3]
                 with state.lock:
-                    self._send_json(state.tool_calls.get(session_id, []))
+                    payload = list(state.tool_calls.get(session_id, []))
+                self._send_json(payload)
             else:
                 self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -113,6 +126,10 @@ def make_handler(state: AppState, server_password: str):
             parsed = urlparse(self.path)
             path = parsed.path
             data = self._read_json()
+
+            if data is None:
+                self._send_json({"error": "Invalid JSON"}, status=HTTPStatus.BAD_REQUEST)
+                return
 
             if path == "/api/repositories":
                 repo_url = data.get("url", "").strip()
@@ -131,13 +148,29 @@ def make_handler(state: AppState, server_password: str):
                     self._send_json({"error": "agent_id is required"}, status=HTTPStatus.BAD_REQUEST)
                     return
 
+                thinking_effort = data.get("thinking_effort", "medium")
+                if thinking_effort not in VALID_THINKING_EFFORTS:
+                    self._send_json(
+                        {"error": f"thinking_effort must be one of {sorted(VALID_THINKING_EFFORTS)}"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+
+                mode = data.get("mode", "plan")
+                if mode not in VALID_MODES:
+                    self._send_json(
+                        {"error": f"mode must be one of {sorted(VALID_MODES)}"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+
                 session = {
                     "id": str(uuid.uuid4()),
                     "repository_id": data.get("repository_id"),
                     "agent_id": agent_id,
                     "model": data.get("model", "gpt-5-mini"),
-                    "thinking_effort": data.get("thinking_effort", "medium"),
-                    "mode": data.get("mode", "plan"),
+                    "thinking_effort": thinking_effort,
+                    "mode": mode,
                     "allowed_tools": data.get("allowed_tools", []),
                     "status": "running",
                     "created_at": now_iso(),
@@ -159,9 +192,13 @@ def make_handler(state: AppState, server_password: str):
                 }
                 with state.lock:
                     if session_id not in state.tool_calls:
-                        self._send_json({"error": "Session not found"}, status=HTTPStatus.NOT_FOUND)
-                        return
-                    state.tool_calls[session_id].append(tool_call)
+                        not_found = True
+                    else:
+                        not_found = False
+                        state.tool_calls[session_id].append(tool_call)
+                if not_found:
+                    self._send_json({"error": "Session not found"}, status=HTTPStatus.NOT_FOUND)
+                    return
                 self._send_json(tool_call, status=HTTPStatus.CREATED)
                 return
 
@@ -178,7 +215,27 @@ def make_handler(state: AppState, server_password: str):
 
             session_id = path.split("/")[3]
             updates = self._read_json()
+
+            if updates is None:
+                self._send_json({"error": "Invalid JSON"}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            if "thinking_effort" in updates and updates["thinking_effort"] not in VALID_THINKING_EFFORTS:
+                self._send_json(
+                    {"error": f"thinking_effort must be one of {sorted(VALID_THINKING_EFFORTS)}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+
+            if "mode" in updates and updates["mode"] not in VALID_MODES:
+                self._send_json(
+                    {"error": f"mode must be one of {sorted(VALID_MODES)}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+
             allowed_fields = {"model", "thinking_effort", "mode", "allowed_tools"}
+            result = None
 
             with state.lock:
                 for session in state.sessions:
@@ -187,10 +244,13 @@ def make_handler(state: AppState, server_password: str):
                             if key in updates:
                                 session[key] = updates[key]
                         session["updated_at"] = now_iso()
-                        self._send_json(session)
-                        return
+                        result = dict(session)
+                        break
 
-            self._send_json({"error": "Session not found"}, status=HTTPStatus.NOT_FOUND)
+            if result is not None:
+                self._send_json(result)
+            else:
+                self._send_json({"error": "Session not found"}, status=HTTPStatus.NOT_FOUND)
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
