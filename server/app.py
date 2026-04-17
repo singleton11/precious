@@ -1,279 +1,236 @@
 from __future__ import annotations
 
-import argparse
-import hmac
-import json
 import os
-import threading
 import uuid
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from enum import Enum
 from typing import Any
-from urllib.parse import urlparse
+
+import uvicorn
+from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+from pydantic import BaseModel, Field
 
 
-@dataclass
-class AppState:
-    repositories: list[dict[str, Any]] = field(default_factory=list)
-    sessions: list[dict[str, Any]] = field(default_factory=list)
-    tool_calls: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    lock: threading.Lock = field(default_factory=threading.Lock)
+# ---------------------------------------------------------------------------
+# Agent registry – each agent advertises its own supported modes and
+# thinking-effort levels so the client can adapt dynamically.
+# ---------------------------------------------------------------------------
+
+class AgentDefinition(BaseModel):
+    id: str
+    name: str
+    supported_thinking_efforts: list[str]
+    supported_modes: list[str]
 
 
-DEFAULT_AGENTS = [
-    {"id": "acp-coder", "name": "ACP Coder"},
-    {"id": "acp-reviewer", "name": "ACP Reviewer"},
+AGENT_REGISTRY: list[AgentDefinition] = [
+    AgentDefinition(
+        id="acp-coder",
+        name="ACP Coder",
+        supported_thinking_efforts=["low", "medium", "high"],
+        supported_modes=["plan", "build", "chat"],
+    ),
+    AgentDefinition(
+        id="acp-reviewer",
+        name="ACP Reviewer",
+        supported_thinking_efforts=["low", "medium", "high"],
+        supported_modes=["plan", "chat"],
+    ),
 ]
 
-VALID_THINKING_EFFORTS = {"low", "medium", "high"}
-VALID_MODES = {"plan", "build", "chat"}
+_AGENTS_BY_ID: dict[str, AgentDefinition] = {a.id: a for a in AGENT_REGISTRY}
 
 
-def now_iso() -> str:
+def _now_iso() -> str:
     return datetime.now(tz=UTC).isoformat()
 
 
-def make_handler(state: AppState, server_password: str):
-    class Handler(BaseHTTPRequestHandler):
-        def _send_json(self, payload: Any, status: int = HTTPStatus.OK) -> None:
-            body = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
 
-        def _read_json(self) -> dict[str, Any] | None:
-            content_length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(content_length)
-            if not raw:
-                return {}
-            try:
-                return json.loads(raw.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return None
-
-        def _require_password(self) -> bool:
-            if not self.path.startswith("/api/"):
-                return True
-            provided = self.headers.get("X-Server-Password", "")
-            if hmac.compare_digest(provided, server_password):
-                return True
-            self._send_json({"error": "Unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
-            return False
-
-        def _serve_client(self, path: str) -> bool:
-            root = Path(__file__).resolve().parent.parent / "client"
-            if path in {"/", "/index.html"}:
-                file_path = root / "index.html"
-                content_type = "text/html; charset=utf-8"
-            elif path == "/app.js":
-                file_path = root / "app.js"
-                content_type = "application/javascript; charset=utf-8"
-            else:
-                return False
-
-            if not file_path.exists():
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return True
-
-            data = file_path.read_bytes()
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return True
-
-        def do_GET(self) -> None:  # noqa: N802
-            parsed = urlparse(self.path)
-            path = parsed.path
-
-            if self._serve_client(path):
-                return
-
-            if path == "/health":
-                self._send_json({"status": "ok"})
-                return
-
-            if not self._require_password():
-                return
-
-            if path == "/api/repositories":
-                with state.lock:
-                    payload = list(state.repositories)
-                self._send_json(payload)
-            elif path == "/api/agents":
-                self._send_json(DEFAULT_AGENTS)
-            elif path == "/api/sessions":
-                with state.lock:
-                    payload = list(state.sessions)
-                self._send_json(payload)
-            elif path.startswith("/api/sessions/") and path.endswith("/tool-calls"):
-                session_id = path.split("/")[3]
-                with state.lock:
-                    payload = list(state.tool_calls.get(session_id, []))
-                self._send_json(payload)
-            else:
-                self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
-
-        def do_POST(self) -> None:  # noqa: N802
-            if not self._require_password():
-                return
-            parsed = urlparse(self.path)
-            path = parsed.path
-            data = self._read_json()
-
-            if data is None:
-                self._send_json({"error": "Invalid JSON"}, status=HTTPStatus.BAD_REQUEST)
-                return
-
-            if path == "/api/repositories":
-                repo_url = data.get("url", "").strip()
-                if not repo_url:
-                    self._send_json({"error": "Repository URL is required"}, status=HTTPStatus.BAD_REQUEST)
-                    return
-                item = {"id": str(uuid.uuid4()), "url": repo_url, "created_at": now_iso()}
-                with state.lock:
-                    state.repositories.append(item)
-                self._send_json(item, status=HTTPStatus.CREATED)
-                return
-
-            if path == "/api/sessions":
-                agent_id = data.get("agent_id", "").strip()
-                if not agent_id:
-                    self._send_json({"error": "agent_id is required"}, status=HTTPStatus.BAD_REQUEST)
-                    return
-
-                thinking_effort = data.get("thinking_effort", "medium")
-                if thinking_effort not in VALID_THINKING_EFFORTS:
-                    self._send_json(
-                        {"error": f"thinking_effort must be one of {sorted(VALID_THINKING_EFFORTS)}"},
-                        status=HTTPStatus.BAD_REQUEST,
-                    )
-                    return
-
-                mode = data.get("mode", "plan")
-                if mode not in VALID_MODES:
-                    self._send_json(
-                        {"error": f"mode must be one of {sorted(VALID_MODES)}"},
-                        status=HTTPStatus.BAD_REQUEST,
-                    )
-                    return
-
-                session = {
-                    "id": str(uuid.uuid4()),
-                    "repository_id": data.get("repository_id"),
-                    "agent_id": agent_id,
-                    "model": data.get("model", "gpt-5-mini"),
-                    "thinking_effort": thinking_effort,
-                    "mode": mode,
-                    "allowed_tools": data.get("allowed_tools", []),
-                    "status": "running",
-                    "created_at": now_iso(),
-                }
-                with state.lock:
-                    state.sessions.append(session)
-                    state.tool_calls[session["id"]] = []
-                self._send_json(session, status=HTTPStatus.CREATED)
-                return
-
-            if path.startswith("/api/sessions/") and path.endswith("/tool-calls"):
-                session_id = path.split("/")[3]
-                tool_call = {
-                    "id": str(uuid.uuid4()),
-                    "name": data.get("name", "unknown"),
-                    "arguments": data.get("arguments", {}),
-                    "status": data.get("status", "completed"),
-                    "created_at": now_iso(),
-                }
-                with state.lock:
-                    if session_id not in state.tool_calls:
-                        not_found = True
-                    else:
-                        not_found = False
-                        state.tool_calls[session_id].append(tool_call)
-                if not_found:
-                    self._send_json({"error": "Session not found"}, status=HTTPStatus.NOT_FOUND)
-                    return
-                self._send_json(tool_call, status=HTTPStatus.CREATED)
-                return
-
-            self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
-
-        def do_PATCH(self) -> None:  # noqa: N802
-            if not self._require_password():
-                return
-            parsed = urlparse(self.path)
-            path = parsed.path
-            if not path.startswith("/api/sessions/"):
-                self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
-                return
-
-            session_id = path.split("/")[3]
-            updates = self._read_json()
-
-            if updates is None:
-                self._send_json({"error": "Invalid JSON"}, status=HTTPStatus.BAD_REQUEST)
-                return
-
-            if "thinking_effort" in updates and updates["thinking_effort"] not in VALID_THINKING_EFFORTS:
-                self._send_json(
-                    {"error": f"thinking_effort must be one of {sorted(VALID_THINKING_EFFORTS)}"},
-                    status=HTTPStatus.BAD_REQUEST,
-                )
-                return
-
-            if "mode" in updates and updates["mode"] not in VALID_MODES:
-                self._send_json(
-                    {"error": f"mode must be one of {sorted(VALID_MODES)}"},
-                    status=HTTPStatus.BAD_REQUEST,
-                )
-                return
-
-            allowed_fields = {"model", "thinking_effort", "mode", "allowed_tools"}
-            result = None
-
-            with state.lock:
-                for session in state.sessions:
-                    if session["id"] == session_id:
-                        for key in allowed_fields:
-                            if key in updates:
-                                session[key] = updates[key]
-                        session["updated_at"] = now_iso()
-                        result = dict(session)
-                        break
-
-            if result is not None:
-                self._send_json(result)
-            else:
-                self._send_json({"error": "Session not found"}, status=HTTPStatus.NOT_FOUND)
-
-        def log_message(self, fmt: str, *args: Any) -> None:
-            return
-
-    return Handler
+class RepositoryCreate(BaseModel):
+    url: str = Field(..., min_length=1)
 
 
-def make_server(host: str, port: int, password: str) -> ThreadingHTTPServer:
+class SessionCreate(BaseModel):
+    agent_id: str = Field(..., min_length=1)
+    repository_id: str | None = None
+    model: str = "gpt-5-mini"
+    thinking_effort: str = "medium"
+    mode: str = "plan"
+    allowed_tools: list[str] = Field(default_factory=list)
+
+
+class SessionUpdate(BaseModel):
+    model: str | None = None
+    thinking_effort: str | None = None
+    mode: str | None = None
+    allowed_tools: list[str] | None = None
+
+
+class ToolCallCreate(BaseModel):
+    name: str = "unknown"
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    status: str = "completed"
+
+
+# ---------------------------------------------------------------------------
+# In-memory state
+# ---------------------------------------------------------------------------
+
+class AppState:
+    def __init__(self) -> None:
+        self.repositories: list[dict[str, Any]] = []
+        self.sessions: list[dict[str, Any]] = []
+        self.tool_calls: dict[str, list[dict[str, Any]]] = {}
+
+
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
+
+def create_app(password: str | None = None) -> FastAPI:
+    server_password = password or os.environ.get("PRECIOUS_SERVER_PASSWORD", "changeme")
     state = AppState()
-    handler = make_handler(state, password)
-    return ThreadingHTTPServer((host, port), handler)
+    app = FastAPI(title="Precious Agent Management")
+
+    # --- Auth dependency ---------------------------------------------------
+
+    async def require_password(x_server_password: str = Header("")):
+        if not x_server_password or x_server_password != server_password:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    # --- Helpers -----------------------------------------------------------
+
+    def _validate_agent_fields(agent_id: str, thinking_effort: str | None, mode: str | None) -> None:
+        agent = _AGENTS_BY_ID.get(agent_id)
+        if agent is None:
+            raise HTTPException(status_code=400, detail=f"Unknown agent_id: {agent_id}")
+        if thinking_effort is not None and thinking_effort not in agent.supported_thinking_efforts:
+            raise HTTPException(
+                status_code=400,
+                detail=f"thinking_effort must be one of {agent.supported_thinking_efforts}",
+            )
+        if mode is not None and mode not in agent.supported_modes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"mode must be one of {agent.supported_modes}",
+            )
+
+    def _find_session(session_id: str) -> dict[str, Any]:
+        for s in state.sessions:
+            if s["id"] == session_id:
+                return s
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # --- Health (no auth) --------------------------------------------------
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    # --- Repositories ------------------------------------------------------
+
+    @app.get("/api/repositories", dependencies=[Depends(require_password)])
+    async def list_repositories():
+        return state.repositories
+
+    @app.post("/api/repositories", status_code=201, dependencies=[Depends(require_password)])
+    async def create_repository(body: RepositoryCreate):
+        item = {"id": str(uuid.uuid4()), "url": body.url.strip(), "created_at": _now_iso()}
+        state.repositories.append(item)
+        return item
+
+    # --- Agents ------------------------------------------------------------
+
+    @app.get("/api/agents", dependencies=[Depends(require_password)])
+    async def list_agents():
+        return [a.model_dump() for a in AGENT_REGISTRY]
+
+    # --- Sessions ----------------------------------------------------------
+
+    @app.get("/api/sessions", dependencies=[Depends(require_password)])
+    async def list_sessions():
+        return state.sessions
+
+    @app.post("/api/sessions", status_code=201, dependencies=[Depends(require_password)])
+    async def create_session(body: SessionCreate):
+        _validate_agent_fields(body.agent_id, body.thinking_effort, body.mode)
+        session = {
+            "id": str(uuid.uuid4()),
+            "repository_id": body.repository_id,
+            "agent_id": body.agent_id,
+            "model": body.model,
+            "thinking_effort": body.thinking_effort,
+            "mode": body.mode,
+            "allowed_tools": body.allowed_tools,
+            "status": "running",
+            "created_at": _now_iso(),
+        }
+        state.sessions.append(session)
+        state.tool_calls[session["id"]] = []
+        return session
+
+    @app.patch("/api/sessions/{session_id}", dependencies=[Depends(require_password)])
+    async def update_session(session_id: str, body: SessionUpdate):
+        session = _find_session(session_id)
+        # Validate against the agent's supported values
+        _validate_agent_fields(
+            session["agent_id"],
+            body.thinking_effort,
+            body.mode,
+        )
+        for field_name in ("model", "thinking_effort", "mode", "allowed_tools"):
+            value = getattr(body, field_name)
+            if value is not None:
+                session[field_name] = value
+        session["updated_at"] = _now_iso()
+        return session
+
+    # --- Tool calls --------------------------------------------------------
+
+    @app.get("/api/sessions/{session_id}/tool-calls", dependencies=[Depends(require_password)])
+    async def list_tool_calls(session_id: str):
+        if session_id not in state.tool_calls:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return state.tool_calls[session_id]
+
+    @app.post("/api/sessions/{session_id}/tool-calls", status_code=201, dependencies=[Depends(require_password)])
+    async def create_tool_call(session_id: str, body: ToolCallCreate):
+        if session_id not in state.tool_calls:
+            raise HTTPException(status_code=404, detail="Session not found")
+        tool_call = {
+            "id": str(uuid.uuid4()),
+            "name": body.name,
+            "arguments": body.arguments,
+            "status": body.status,
+            "created_at": _now_iso(),
+        }
+        state.tool_calls[session_id].append(tool_call)
+        return tool_call
+
+    # --- Static files (serve React build) ----------------------------------
+
+    client_dist = Path(__file__).resolve().parent.parent / "client" / "dist"
+    if client_dist.is_dir():
+        app.mount("/", StaticFiles(directory=str(client_dist), html=True), name="client")
+
+    return app
 
 
 def main() -> None:
+    import argparse
+
     parser = argparse.ArgumentParser(description="Run precious agent management server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    password = os.environ.get("PRECIOUS_SERVER_PASSWORD", "changeme")
-    server = make_server(args.host, args.port, password)
-    print(f"Server listening on http://{args.host}:{args.port}")
-    server.serve_forever()
+    app = create_app()
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

@@ -4,87 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Precious Agent Management</title>
-    <style>
-      body { font-family: sans-serif; margin: 2rem; }
-      section { margin-bottom: 2rem; border: 1px solid #ddd; padding: 1rem; border-radius: 8px; }
-      input, select, button { margin: 0.25rem; }
-      ul { padding-left: 1.2rem; }
-      .row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-    </style>
   </head>
   <body>
-    <h1>Precious Agent Management</h1>
-
-    <section>
-      <h2>Server Access</h2>
-      <label>Password <input id="password" type="password" value="changeme" /></label>
-      <button id="refresh-all">Refresh all</button>
-      <div id="status"></div>
-    </section>
-
-    <section>
-      <h2>Repositories</h2>
-      <div class="row">
-        <input id="repo-url" placeholder="https://github.com/org/repo" />
-        <button id="add-repo">Add repository</button>
-      </div>
-      <ul id="repo-list"></ul>
-    </section>
-
-    <section>
-      <h2>Session Composer</h2>
-      <div class="row">
-        <select id="repository-id"><option value="">No repository</option></select>
-        <select id="agent-id"></select>
-        <input id="model" value="gpt-5-mini" />
-        <select id="thinking-effort">
-          <option>low</option>
-          <option selected>medium</option>
-          <option>high</option>
-        </select>
-        <select id="mode">
-          <option selected>plan</option>
-          <option>build</option>
-          <option>chat</option>
-        </select>
-        <button id="create-session">Start session</button>
-      </div>
-      <ul id="session-list"></ul>
-    </section>
-
-    <section>
-      <h2>Session Controls</h2>
-      <div class="row">
-        <select id="session-id"></select>
-        <input id="switch-model" placeholder="model" value="gpt-5-mini" />
-        <select id="switch-thinking">
-          <option>low</option>
-          <option selected>medium</option>
-          <option>high</option>
-        </select>
-        <select id="switch-mode">
-          <option selected>plan</option>
-          <option>build</option>
-          <option>chat</option>
-        </select>
-        <button id="update-session">Apply</button>
-      </div>
-      <div class="row">
-        <input id="allowed-tools" placeholder="comma separated tools" />
-        <button id="update-tools">Update allowed tools</button>
-      </div>
-    </section>
-
-    <section>
-      <h2>Tool Call Logs</h2>
-      <div class="row">
-        <input id="tool-name" placeholder="tool name" value="example_tool" />
-        <button id="add-log">Add sample log</button>
-        <button id="load-logs">Load logs</button>
-      </div>
-      <ul id="log-list"></ul>
-    </section>
-
-    <script src="/app.js"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

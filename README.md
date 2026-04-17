@@ -1,10 +1,10 @@
 # precious
 
-Minimal agent management MVP with:
-- Python server (password-protected API)
-- Web client (JS) for repositories and session management
+Agent management MVP with:
+- **FastAPI** backend (password-protected API)
+- **React + Vite** web client for repositories and session management
 
-## Use uv for Python tooling
+## Backend (Python / FastAPI)
 
 ```bash
 uv sync
@@ -17,13 +17,23 @@ Set password (defaults to `changeme`):
 export PRECIOUS_SERVER_PASSWORD="changeme"
 ```
 
-Open <http://127.0.0.1:8000>.
+## Client (React)
+
+```bash
+cd client
+npm install
+npm run dev       # dev server at http://localhost:5173, proxies /api to :8000
+npm run build     # production build into client/dist/ (served by FastAPI)
+```
+
+For production, run `npm run build` then start the server — FastAPI serves the
+built client at `/`.
 
 ## API overview
 
 - `GET /api/repositories`
 - `POST /api/repositories`
-- `GET /api/agents`
+- `GET /api/agents` — each agent exposes `supported_thinking_efforts` and `supported_modes`
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `PATCH /api/sessions/{id}`
@@ -35,5 +45,5 @@ All `/api/*` endpoints require header `X-Server-Password`.
 ## Tests
 
 ```bash
-uv run python -m unittest discover -s tests -v
+uv run python -m pytest tests/ -v
 ```
