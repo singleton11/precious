@@ -1,5 +1,8 @@
 # precious
 
+[![CI](https://github.com/singleton11/precious/actions/workflows/ci.yml/badge.svg)](https://github.com/singleton11/precious/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/singleton11/precious/branch/main/graph/badge.svg)](https://codecov.io/gh/singleton11/precious)
+
 Agent management MVP with:
 - **FastAPI** backend (password-protected API)
 - **React + Vite** web client for repositories and session management
