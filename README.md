@@ -4,6 +4,15 @@ Agent management MVP with:
 - **FastAPI** backend (password-protected API)
 - **React + Vite** web client for repositories and session management
 
+## Quick start (server + client)
+
+```bash
+uv sync
+uv run precious-dev        # starts both backend (:8000) and Vite client (:5173)
+```
+
+Open <http://localhost:5173>.
+
 ## Backend (Python / FastAPI)
 
 ```bash
