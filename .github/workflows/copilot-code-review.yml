@@ -15,7 +15,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - name: Run Copilot code review
-        uses: github/copilot-code-review-action@v1
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copilot Code Review
+        uses: github/copilot-code-review@v1
